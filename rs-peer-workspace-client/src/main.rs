@@ -97,6 +97,7 @@ enum NetEvent {
     Connected {
         session_id: Uuid,
         server_name: String,
+        via_p2p: bool,
         turn: Option<TurnCredentials>,
     },
     Output(String),
@@ -117,6 +118,7 @@ struct ClientApp {
     logs: String,
     command_input: String,
     status: String,
+    transport: String,
     event_rx: Option<Receiver<NetEvent>>,
     command_tx: Option<tokio_mpsc::UnboundedSender<NetCommand>>,
     session_id: Option<Uuid>,
@@ -137,6 +139,7 @@ impl Default for ClientApp {
             logs: String::new(),
             command_input: String::new(),
             status: "Disconnected".to_string(),
+            transport: "None".to_string(),
             event_rx: None,
             command_tx: None,
             session_id: None,
@@ -178,6 +181,8 @@ impl eframe::App for ClientApp {
 
                 ui.separator();
                 ui.label(format!("Status: {}", self.status));
+                ui.separator();
+                ui.label(format!("Transport: {}", self.transport));
             });
         });
 
@@ -226,9 +231,10 @@ impl eframe::App for ClientApp {
                     );
                     ui.separator();
                     ui.horizontal(|ui| {
+                        let input_width = (ui.available_width() - 170.0).clamp(140.0, 700.0);
                         ui.add(
                             egui::TextEdit::singleline(&mut self.command_input)
-                                .desired_width(f32::INFINITY)
+                                .desired_width(input_width)
                                 .hint_text("Enter command"),
                         );
 
@@ -297,15 +303,24 @@ impl ClientApp {
                 Some(NetEvent::Connected {
                     session_id,
                     server_name,
+                    via_p2p,
                     turn,
                 }) => {
                     self.session_id = Some(session_id);
                     self.status = format!("Connected to {}", server_name);
                     self.show_terminal_window = true;
+                    self.transport = "WebSocket relay".to_string();
                     self.logs.push_str(&format!(
                         "Connected. Session: {}\n",
                         session_id
                     ));
+                    if via_p2p {
+                        self.logs.push_str(
+                            "P2P requested. TURN credentials received if available, but command traffic is currently WebSocket relay.\n",
+                        );
+                    } else {
+                        self.logs.push_str("Using WebSocket relay transport.\n");
+                    }
                     if let Some(turn) = turn {
                         self.logs.push_str(&format!(
                             "TURN provided: {} (user: {})\n",
@@ -321,12 +336,14 @@ impl ClientApp {
                 }
                 Some(NetEvent::SessionClosed(reason)) => {
                     self.status = "Disconnected".to_string();
+                    self.transport = "None".to_string();
                     self.logs.push_str(&format!("Session closed: {}\n", reason));
                     self.session_id = None;
                     self.command_tx = None;
                 }
                 Some(NetEvent::Error(reason)) => {
                     self.status = format!("Error: {}", reason);
+                    self.transport = "None".to_string();
                     self.logs.push_str(&format!("Error: {}\n", reason));
                     self.session_id = None;
                     self.command_tx = None;
@@ -340,6 +357,8 @@ impl ClientApp {
 
     fn send_command(&mut self, cmd: String) {
         if let Some(tx) = &self.command_tx {
+            self.logs
+                .push_str(&format!("[send via {}] {}\n", self.transport, cmd));
             let _ = tx.send(NetCommand::SendCommand(cmd));
         }
     }
@@ -409,9 +428,9 @@ async fn network_task(
                         let _ = event_tx.send(NetEvent::Servers(servers.clone()));
                         let _ = event_tx.send(NetEvent::Status(format!("{} server(s) available", servers.len())));
                     }
-                    ProxyToPeer::Connected { session_id, server_name, turn, .. } => {
+                    ProxyToPeer::Connected { session_id, server_name, via_p2p, turn } => {
                         active_session = Some(session_id);
-                        let _ = event_tx.send(NetEvent::Connected { session_id, server_name, turn });
+                        let _ = event_tx.send(NetEvent::Connected { session_id, server_name, via_p2p, turn });
                     }
                     ProxyToPeer::Output { session_id, output, .. } => {
                         if Some(session_id) == active_session {

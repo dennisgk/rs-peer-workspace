@@ -22,21 +22,13 @@ UI flow:
   - `Use P2P through TURN if possible` (checked by default)
 - On success, `Remote Terminal` window opens for command input/output.
 
-## Binary build Dockerfile
+## Build binary
 
-`Dockerfile.build` compiles release binaries and places them in `/out`.
-
-Build for Linux x64:
+Build locally:
 ```powershell
-docker build -f Dockerfile.build --build-arg TARGET=x86_64-unknown-linux-gnu -t rs-peer-client-build .
-docker run --rm -v ${PWD}/out:/out rs-peer-client-build
+cargo build --release
 ```
 
-Build for Windows x64 (GNU target):
-```powershell
-docker build -f Dockerfile.build --build-arg TARGET=x86_64-pc-windows-gnu -t rs-peer-client-build-win .
-docker run --rm -v ${PWD}/out-win:/out rs-peer-client-build-win
-```
-
-Note: GUI cross-targets can need extra system packages/toolchains.
-Use Rust 1.93+ for this Docker build because `runmat-runtime` dependencies require newer integer APIs.
+Output:
+- Windows: `target\\release\\rs-peer-workspace-client.exe`
+- Linux/macOS: `target/release/rs-peer-workspace-client`

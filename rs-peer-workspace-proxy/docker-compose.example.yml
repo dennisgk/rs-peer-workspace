@@ -1,0 +1,43 @@
+version: "3.9"
+
+services:
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rs-peer-proxy
+    command:
+      - "--bind"
+      - "0.0.0.0:9000"
+      - "--proxy-password"
+      - "${PROXY_PASSWORD:-change-me-proxy-password}"
+      - "--turn-url"
+      - "turn:coturn:3478"
+      - "--turn-username"
+      - "${TURN_USERNAME:-peer}"
+      - "--turn-password"
+      - "${TURN_PASSWORD:-peer-secret}"
+    ports:
+      - "9000:9000"
+    depends_on:
+      - coturn
+    restart: unless-stopped
+
+  coturn:
+    image: coturn/coturn:latest
+    container_name: rs-peer-coturn
+    command:
+      - "-n"
+      - "--log-file=stdout"
+      - "--realm=rs-peer.local"
+      - "--fingerprint"
+      - "--lt-cred-mech"
+      - "--user=${TURN_USERNAME:-peer}:${TURN_PASSWORD:-peer-secret}"
+      - "--listening-port=3478"
+      - "--min-port=49160"
+      - "--max-port=49200"
+    ports:
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      - "49160-49200:49160-49200/udp"
+    restart: unless-stopped

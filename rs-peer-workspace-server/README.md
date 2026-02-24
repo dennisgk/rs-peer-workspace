@@ -29,3 +29,4 @@ docker run --rm -v ${PWD}/out-win:/out rs-peer-server-build-win
 ```
 
 Note: non-native targets may require additional target toolchains depending on platform and dependency requirements.
+Use Rust 1.93+ for this Docker build because `runmat-runtime` dependencies require newer integer APIs.

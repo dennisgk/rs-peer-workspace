@@ -39,3 +39,4 @@ docker run --rm -v ${PWD}/out-win:/out rs-peer-client-build-win
 ```
 
 Note: GUI cross-targets can need extra system packages/toolchains.
+Use Rust 1.93+ for this Docker build because `runmat-runtime` dependencies require newer integer APIs.

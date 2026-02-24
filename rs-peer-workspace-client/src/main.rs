@@ -1,11 +1,22 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 
 use eframe::egui;
-use futures_util::{Sink, SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::{mpsc as tokio_mpsc, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
+use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::APIBuilder;
+use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
+use webrtc::data_channel::RTCDataChannel;
+use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
+use webrtc::ice_transport::ice_server::RTCIceServer;
+use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::peer_connection::RTCPeerConnection;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -33,6 +44,10 @@ enum ClientToProxy {
     },
     DisconnectSession {
         session_id: Uuid,
+    },
+    ClientSignal {
+        session_id: Uuid,
+        signal: SignalPayload,
     },
 }
 
@@ -66,6 +81,11 @@ enum ProxyToPeer {
         session_id: Uuid,
         reason: String,
     },
+    PeerSignal {
+        session_id: Uuid,
+        from: AuthRole,
+        signal: SignalPayload,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +93,18 @@ struct TurnCredentials {
     url: String,
     username: String,
     password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SignalPayload {
+    SdpOffer { sdp: String },
+    SdpAnswer { sdp: String },
+    IceCandidate {
+        candidate: String,
+        sdp_mid: Option<String>,
+        sdp_mline_index: Option<u16>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +125,7 @@ enum NetCommand {
 #[derive(Debug)]
 enum NetEvent {
     Status(String),
+    Transport(String),
     Servers(Vec<String>),
     Connected {
         session_id: Uuid,
@@ -192,7 +225,7 @@ impl eframe::App for ClientApp {
                 .open(&mut open)
                 .resizable(false)
                 .show(ctx, |ui| {
-                    ui.label("Proxy Address (ws://.../ws)");
+                    ui.label("Proxy Address (ws://.../ws or wss://.../ws)");
                     ui.text_edit_singleline(&mut self.proxy_addr);
                     ui.label("Proxy Password");
                     ui.add(egui::TextEdit::singleline(&mut self.proxy_password).password(true));
@@ -263,6 +296,7 @@ impl ClientApp {
 
         self.logs.clear();
         self.status = "Connecting...".to_string();
+        self.transport = "Pending".to_string();
         self.event_rx = Some(event_rx);
         self.command_tx = Some(command_tx);
 
@@ -284,14 +318,14 @@ impl ClientApp {
     fn poll_events(&mut self) {
         let mut keep_receiving = true;
         while keep_receiving {
-            let next_event = self
-                .event_rx
-                .as_ref()
-                .and_then(|rx| rx.try_recv().ok());
+            let next_event = self.event_rx.as_ref().and_then(|rx| rx.try_recv().ok());
 
             match next_event {
                 Some(NetEvent::Status(msg)) => {
                     self.status = msg;
+                }
+                Some(NetEvent::Transport(msg)) => {
+                    self.transport = msg;
                 }
                 Some(NetEvent::Servers(servers)) => {
                     self.known_servers.clear();
@@ -309,17 +343,15 @@ impl ClientApp {
                     self.session_id = Some(session_id);
                     self.status = format!("Connected to {}", server_name);
                     self.show_terminal_window = true;
-                    self.transport = "WebSocket relay".to_string();
-                    self.logs.push_str(&format!(
-                        "Connected. Session: {}\n",
-                        session_id
-                    ));
+                    self.logs
+                        .push_str(&format!("Connected. Session: {}\n", session_id));
                     if via_p2p {
                         self.logs.push_str(
-                            "P2P requested. TURN credentials received if available, but command traffic is currently WebSocket relay.\n",
+                            "P2P requested. Attempting TURN peer connection first; fallback is WebSocket relay.\n",
                         );
                     } else {
                         self.logs.push_str("Using WebSocket relay transport.\n");
+                        self.transport = "WebSocket relay".to_string();
                     }
                     if let Some(turn) = turn {
                         self.logs.push_str(&format!(
@@ -358,7 +390,7 @@ impl ClientApp {
     fn send_command(&mut self, cmd: String) {
         if let Some(tx) = &self.command_tx {
             self.logs
-                .push_str(&format!("[send via {}] {}\n", self.transport, cmd));
+                .push_str(&format!("[send requested] {}\n", cmd));
             let _ = tx.send(NetCommand::SendCommand(cmd));
         }
     }
@@ -378,28 +410,38 @@ async fn network_task(
     let (ws_stream, _) = connect_async(&cfg.proxy_addr).await?;
     let (mut write, mut read) = ws_stream.split();
 
+    let (ws_send_tx, mut ws_send_rx) = tokio_mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        while let Some(text) = ws_send_rx.recv().await {
+            if write.send(Message::Text(text.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
     send_json(
-        &mut write,
+        &ws_send_tx,
         &ClientToProxy::AuthProxy {
             proxy_password: cfg.proxy_password,
             role: AuthRole::Client,
         },
-    )
-    .await?;
+    )?;
 
-    send_json(&mut write, &ClientToProxy::ListServers).await?;
+    send_json(&ws_send_tx, &ClientToProxy::ListServers)?;
 
     send_json(
-        &mut write,
+        &ws_send_tx,
         &ClientToProxy::ConnectServer {
             server_name: cfg.server_name,
             server_password: cfg.server_password,
             use_p2p: cfg.use_p2p,
         },
-    )
-    .await?;
+    )?;
 
     let mut active_session: Option<Uuid> = None;
+    let mut peer_connection: Option<Arc<RTCPeerConnection>> = None;
+    let data_channel = Arc::new(Mutex::new(None::<Arc<RTCDataChannel>>));
+    let p2p_ready = Arc::new(AtomicBool::new(false));
 
     loop {
         tokio::select! {
@@ -430,7 +472,57 @@ async fn network_task(
                     }
                     ProxyToPeer::Connected { session_id, server_name, via_p2p, turn } => {
                         active_session = Some(session_id);
-                        let _ = event_tx.send(NetEvent::Connected { session_id, server_name, via_p2p, turn });
+                        let _ = event_tx.send(NetEvent::Connected { session_id, server_name, via_p2p, turn: turn.clone() });
+
+                        if via_p2p {
+                            if let Some(turn_cfg) = turn {
+                                let _ = event_tx.send(NetEvent::Transport("Attempting P2P via TURN".to_string()));
+                                let (pc, dc) = create_client_peer_connection(
+                                    session_id,
+                                    turn_cfg,
+                                    ws_send_tx.clone(),
+                                    event_tx.clone(),
+                                    p2p_ready.clone(),
+                                ).await?;
+                                *data_channel.lock().await = Some(dc);
+                                let offer = pc.create_offer(None).await?;
+                                pc.set_local_description(offer).await?;
+                                if let Some(local) = pc.local_description().await {
+                                    send_json(&ws_send_tx, &ClientToProxy::ClientSignal {
+                                        session_id,
+                                        signal: SignalPayload::SdpOffer { sdp: local.sdp },
+                                    })?;
+                                }
+                                peer_connection = Some(pc);
+                            } else {
+                                let _ = event_tx.send(NetEvent::Transport("WebSocket relay (no TURN credentials)".to_string()));
+                            }
+                        } else {
+                            let _ = event_tx.send(NetEvent::Transport("WebSocket relay".to_string()));
+                        }
+                    }
+                    ProxyToPeer::PeerSignal { session_id, from, signal } => {
+                        if Some(session_id) != active_session || from != AuthRole::Server {
+                            continue;
+                        }
+                        if let Some(pc) = &peer_connection {
+                            match signal {
+                                SignalPayload::SdpAnswer { sdp } => {
+                                    let answer = RTCSessionDescription::answer(sdp)?;
+                                    pc.set_remote_description(answer).await?;
+                                }
+                                SignalPayload::IceCandidate { candidate, sdp_mid, sdp_mline_index } => {
+                                    let init = RTCIceCandidateInit {
+                                        candidate,
+                                        sdp_mid,
+                                        sdp_mline_index,
+                                        username_fragment: None,
+                                    };
+                                    pc.add_ice_candidate(init).await?;
+                                }
+                                SignalPayload::SdpOffer { .. } => {}
+                            }
+                        }
                     }
                     ProxyToPeer::Output { session_id, output, .. } => {
                         if Some(session_id) == active_session {
@@ -439,6 +531,9 @@ async fn network_task(
                     }
                     ProxyToPeer::SessionClosed { session_id, reason } => {
                         if Some(session_id) == active_session {
+                            if let Some(pc) = &peer_connection {
+                                let _ = pc.close().await;
+                            }
                             let _ = event_tx.send(NetEvent::SessionClosed(reason));
                             break;
                         }
@@ -451,15 +546,28 @@ async fn network_task(
                 match command {
                     NetCommand::SendCommand(command_text) => {
                         if let Some(session_id) = active_session {
-                            send_json(&mut write, &ClientToProxy::ClientCommand {
+                            if p2p_ready.load(Ordering::SeqCst) {
+                                let dc = data_channel.lock().await.clone();
+                                if let Some(dc) = dc {
+                                    let _ = event_tx.send(NetEvent::Transport("P2P data channel".to_string()));
+                                    let _ = dc.send_text(command_text).await;
+                                    continue;
+                                }
+                            }
+
+                            let _ = event_tx.send(NetEvent::Transport("WebSocket relay".to_string()));
+                            send_json(&ws_send_tx, &ClientToProxy::ClientCommand {
                                 session_id,
                                 command: command_text,
-                            }).await?;
+                            })?;
                         }
                     }
                     NetCommand::Disconnect => {
                         if let Some(session_id) = active_session {
-                            let _ = send_json(&mut write, &ClientToProxy::DisconnectSession { session_id }).await;
+                            let _ = send_json(&ws_send_tx, &ClientToProxy::DisconnectSession { session_id });
+                        }
+                        if let Some(pc) = &peer_connection {
+                            let _ = pc.close().await;
                         }
                         let _ = event_tx.send(NetEvent::SessionClosed("client requested disconnect".to_string()));
                         break;
@@ -472,13 +580,99 @@ async fn network_task(
     Ok(())
 }
 
-async fn send_json(
-    sink: &mut (impl Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
-    payload: &impl Serialize,
-) -> anyhow::Result<()> {
+fn send_json(tx: &tokio_mpsc::UnboundedSender<String>, payload: &impl Serialize) -> anyhow::Result<()> {
     let text = serde_json::to_string(payload)?;
-    sink.send(Message::Text(text.into())).await?;
+    let _ = tx.send(text);
     Ok(())
+}
+
+async fn create_client_peer_connection(
+    session_id: Uuid,
+    turn: TurnCredentials,
+    ws_tx: tokio_mpsc::UnboundedSender<String>,
+    event_tx: mpsc::Sender<NetEvent>,
+    p2p_ready: Arc<AtomicBool>,
+) -> anyhow::Result<(Arc<RTCPeerConnection>, Arc<RTCDataChannel>)> {
+    let mut media_engine = MediaEngine::default();
+    media_engine.register_default_codecs()?;
+    let api = APIBuilder::new().with_media_engine(media_engine).build();
+
+    let config = RTCConfiguration {
+        ice_servers: vec![RTCIceServer {
+            urls: vec![turn.url],
+            username: turn.username,
+            credential: turn.password,
+        }],
+        ..Default::default()
+    };
+
+    let pc = Arc::new(api.new_peer_connection(config).await?);
+
+    let ws_tx_ice = ws_tx.clone();
+    pc.on_ice_candidate(Box::new(move |candidate| {
+        let ws_tx_inner = ws_tx_ice.clone();
+        Box::pin(async move {
+            if let Some(candidate) = candidate {
+                if let Ok(json) = candidate.to_json() {
+                    let _ = send_json(
+                        &ws_tx_inner,
+                        &ClientToProxy::ClientSignal {
+                            session_id,
+                            signal: SignalPayload::IceCandidate {
+                                candidate: json.candidate,
+                                sdp_mid: json.sdp_mid,
+                                sdp_mline_index: json.sdp_mline_index,
+                            },
+                        },
+                    );
+                }
+            }
+        })
+    }));
+
+    let dc = pc
+        .create_data_channel(
+            "cmd",
+            Some(RTCDataChannelInit {
+                ordered: Some(true),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+    let ready_flag = p2p_ready.clone();
+    let event_tx_open = event_tx.clone();
+    dc.on_open(Box::new(move || {
+        let ready_flag = ready_flag.clone();
+        let event_tx_open = event_tx_open.clone();
+        Box::pin(async move {
+            ready_flag.store(true, Ordering::SeqCst);
+            let _ = event_tx_open.send(NetEvent::Transport("P2P data channel".to_string()));
+            let _ = event_tx_open.send(NetEvent::Status("P2P channel established".to_string()));
+        })
+    }));
+
+    let ready_flag_close = p2p_ready.clone();
+    let event_tx_close = event_tx.clone();
+    dc.on_close(Box::new(move || {
+        let ready_flag_close = ready_flag_close.clone();
+        let event_tx_close = event_tx_close.clone();
+        Box::pin(async move {
+            ready_flag_close.store(false, Ordering::SeqCst);
+            let _ = event_tx_close.send(NetEvent::Transport("WebSocket relay".to_string()));
+            let _ = event_tx_close.send(NetEvent::Status("P2P channel closed; using WebSocket relay".to_string()));
+        })
+    }));
+
+    dc.on_message(Box::new(move |msg| {
+        let event_tx_msg = event_tx.clone();
+        Box::pin(async move {
+            let text = String::from_utf8_lossy(&msg.data).to_string();
+            let _ = event_tx_msg.send(NetEvent::Output(text));
+        })
+    }));
+
+    Ok((pc, dc))
 }
 
 fn main() {

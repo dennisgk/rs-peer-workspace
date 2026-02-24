@@ -59,6 +59,10 @@ enum ClientToProxy {
     DisconnectSession {
         session_id: Uuid,
     },
+    ClientSignal {
+        session_id: Uuid,
+        signal: SignalPayload,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +75,10 @@ enum ServerToProxy {
     },
     ServerDisconnectSession {
         session_id: Uuid,
+    },
+    ServerSignal {
+        session_id: Uuid,
+        signal: SignalPayload,
     },
 }
 
@@ -101,6 +109,8 @@ enum ProxyToPeer {
     ClientConnected {
         session_id: Uuid,
         client_id: Uuid,
+        via_p2p: bool,
+        turn: Option<TurnCredentials>,
     },
     RunCommand {
         session_id: Uuid,
@@ -115,6 +125,11 @@ enum ProxyToPeer {
         session_id: Uuid,
         reason: String,
     },
+    PeerSignal {
+        session_id: Uuid,
+        from: AuthRole,
+        signal: SignalPayload,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +137,18 @@ struct TurnCredentials {
     url: String,
     username: String,
     password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SignalPayload {
+    SdpOffer { sdp: String },
+    SdpAnswer { sdp: String },
+    IceCandidate {
+        candidate: String,
+        sdp_mid: Option<String>,
+        sdp_mline_index: Option<u16>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -380,6 +407,25 @@ async fn handle_socket(socket: WebSocket, app: AppState) {
                             .await;
                         }
                     }
+                    ServerToProxy::ServerSignal { session_id, signal } => {
+                        let target_client = {
+                            let state = app.state.lock().await;
+                            state.sessions.get(&session_id).map(|s| s.client_conn_id)
+                        };
+
+                        if let Some(client_conn_id) = target_client {
+                            let _ = send_to_connection(
+                                &app.state,
+                                client_conn_id,
+                                &ProxyToPeer::PeerSignal {
+                                    session_id,
+                                    from: AuthRole::Server,
+                                    signal,
+                                },
+                            )
+                            .await;
+                        }
+                    }
                 }
             }
             Some(AuthRole::Client) => {
@@ -451,6 +497,12 @@ async fn handle_socket(socket: WebSocket, app: AppState) {
                                     &ProxyToPeer::ClientConnected {
                                         session_id,
                                         client_id: conn_id,
+                                        via_p2p: use_p2p,
+                                        turn: if use_p2p {
+                                            Some(app.turn.clone())
+                                        } else {
+                                            None
+                                        },
                                     },
                                 )
                                 .await;
@@ -512,6 +564,31 @@ async fn handle_socket(socket: WebSocket, app: AppState) {
                                 &ProxyToPeer::SessionClosed {
                                     session_id,
                                     reason: "client closed session".to_string(),
+                                },
+                            )
+                            .await;
+                        }
+                    }
+                    ClientToProxy::ClientSignal { session_id, signal } => {
+                        let target_server = {
+                            let state = app.state.lock().await;
+                            state.sessions.get(&session_id).and_then(|session| {
+                                if session.client_conn_id == conn_id {
+                                    Some(session.server_conn_id)
+                                } else {
+                                    None
+                                }
+                            })
+                        };
+
+                        if let Some(server_conn_id) = target_server {
+                            let _ = send_to_connection(
+                                &app.state,
+                                server_conn_id,
+                                &ProxyToPeer::PeerSignal {
+                                    session_id,
+                                    from: AuthRole::Client,
+                                    signal,
                                 },
                             )
                             .await;

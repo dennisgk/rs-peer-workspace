@@ -190,7 +190,7 @@ impl ProxyState {
 #[derive(Debug, Clone)]
 struct AppState {
     proxy_password: String,
-    turn: TurnCredentials,
+    turn: Option<TurnCredentials>,
     state: Arc<Mutex<ProxyState>>,
 }
 
@@ -202,28 +202,32 @@ async fn main() -> anyhow::Result<()> {
 
     let app_state = AppState {
         proxy_password: args.proxy_password,
-        turn: TurnCredentials {
-            url: advertised_turn_url.clone(),
+        turn: advertised_turn_url.map(|url| TurnCredentials {
+            url,
             username: args.turn_username,
             password: args.turn_password,
-        },
+        }),
         state: Arc::new(Mutex::new(ProxyState::new())),
     };
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
-        .with_state(app_state);
+        .with_state(app_state.clone());
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("proxy listening on {}", addr);
-    println!("advertising TURN endpoint {}", advertised_turn_url);
+    if let Some(turn) = &app_state.turn {
+        println!("advertising TURN endpoint {}", turn.url);
+    } else {
+        println!("TURN unavailable; P2P disabled and sessions will use WebSocket relay");
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }
 
-async fn resolve_turn_url(args: &Args) -> String {
+async fn resolve_turn_url(args: &Args) -> Option<String> {
     if let Some(explicit) = &args.turn_url {
-        return explicit.clone();
+        return Some(explicit.clone());
     }
 
     let explicit_ip = std::env::var("TURN_PUBLIC_IP")
@@ -231,28 +235,27 @@ async fn resolve_turn_url(args: &Args) -> String {
         .or_else(|| std::env::var("PUBLIC_IP").ok())
         .filter(|v| !v.trim().is_empty());
     if let Some(ip) = explicit_ip {
-        return format!("turn:{}:{}", ip.trim(), args.turn_port);
+        return Some(format!("turn:{}:{}", ip.trim(), args.turn_port));
     }
 
     match reqwest::get(&args.public_ip_service).await {
         Ok(resp) => match resp.text().await {
             Ok(ip) if !ip.trim().is_empty() => {
-                format!("turn:{}:{}", ip.trim(), args.turn_port)
+                Some(format!("turn:{}:{}", ip.trim(), args.turn_port))
             }
             _ => {
                 eprintln!(
-                    "failed to parse public IP response; falling back to turn:127.0.0.1:{}",
-                    args.turn_port
+                    "failed to parse public IP response; disabling TURN and using WebSocket relay"
                 );
-                format!("turn:127.0.0.1:{}", args.turn_port)
+                None
             }
         },
         Err(err) => {
             eprintln!(
-                "failed to detect public IP from {} ({err}); falling back to turn:127.0.0.1:{}",
-                args.public_ip_service, args.turn_port
+                "failed to detect public IP from {} ({err}); disabling TURN and using WebSocket relay",
+                args.public_ip_service
             );
-            format!("turn:127.0.0.1:{}", args.turn_port)
+            None
         }
     }
 }
@@ -517,18 +520,20 @@ async fn handle_socket(socket: WebSocket, app: AppState) {
 
                         match setup {
                             Some(Ok((session_id, server_conn_id))) => {
+                                let p2p_enabled = use_p2p && app.turn.is_some();
+                                let turn_creds = if p2p_enabled {
+                                    app.turn.clone()
+                                } else {
+                                    None
+                                };
                                 let _ = send_to_connection(
                                     &app.state,
                                     conn_id,
                                     &ProxyToPeer::Connected {
                                         session_id,
                                         server_name: server_name.clone(),
-                                        via_p2p: use_p2p,
-                                        turn: if use_p2p {
-                                            Some(app.turn.clone())
-                                        } else {
-                                            None
-                                        },
+                                        via_p2p: p2p_enabled,
+                                        turn: turn_creds.clone(),
                                     },
                                 )
                                 .await;
@@ -539,12 +544,8 @@ async fn handle_socket(socket: WebSocket, app: AppState) {
                                     &ProxyToPeer::ClientConnected {
                                         session_id,
                                         client_id: conn_id,
-                                        via_p2p: use_p2p,
-                                        turn: if use_p2p {
-                                            Some(app.turn.clone())
-                                        } else {
-                                            None
-                                        },
+                                        via_p2p: p2p_enabled,
+                                        turn: turn_creds,
                                     },
                                 )
                                 .await;

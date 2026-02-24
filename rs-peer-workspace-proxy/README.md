@@ -14,15 +14,19 @@ WebSocket proxy for routing client/server sessions.
 ## Run locally
 
 ```powershell
-cargo run -- --bind 0.0.0.0:9000 --proxy-password myProxySecret --turn-url turn:127.0.0.1:3478 --turn-username peer --turn-password peer-secret
+cargo run -- --bind 0.0.0.0:9000 --proxy-password myProxySecret --turn-port 3478 --turn-username peer --turn-password peer-secret
 ```
+
+TURN URL behavior:
+- If `--turn-url` is provided, proxy advertises that exact URL.
+- Otherwise it resolves public IP at startup (or uses `TURN_PUBLIC_IP` / `PUBLIC_IP`) and advertises `turn:<ip>:<turn-port>`.
 
 ## Runtime Dockerfile
 
 Build and run proxy container:
 ```powershell
 docker build -t rs-peer-proxy .
-docker run --rm -p 9000:9000 rs-peer-proxy --proxy-password myProxySecret --turn-url turn:coturn:3478 --turn-username peer --turn-password peer-secret
+docker run --rm -e TURN_PUBLIC_IP=YOUR.PUBLIC.IP -p 9000:9000 rs-peer-proxy --proxy-password myProxySecret --turn-port 3478 --turn-username peer --turn-password peer-secret
 ```
 
 ## Docker Compose (proxy + coturn)
@@ -30,10 +34,12 @@ docker run --rm -p 9000:9000 rs-peer-proxy --proxy-password myProxySecret --turn
 Use `docker-compose.example.yml`:
 ```powershell
 $env:PROXY_PASSWORD="myProxySecret"
+$env:TURN_PUBLIC_IP="YOUR.PUBLIC.IP"
 $env:TURN_USERNAME="peer"
 $env:TURN_PASSWORD="peer-secret"
 docker compose -f docker-compose.example.yml up --build
 ```
+Use a public TURN IP/hostname reachable from both client and server.
 
 ## NGINX note
 

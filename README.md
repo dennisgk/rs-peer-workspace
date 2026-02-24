@@ -13,9 +13,7 @@ Rust peer workspace with three apps:
 4. Client connects to a server using `server_name` + `server_password`.
 5. Proxy creates a session channel and relays command/output over WebSocket.
 6. Proxy cleanup runs automatically when client/server disconnects or session closes.
-7. If client asks for P2P, proxy returns TURN credentials from coturn.
-
-Note: TURN credentials are provided, but command traffic is currently relayed over WebSocket. Direct P2P data-channel transport is the next implementation step.
+7. If client asks for P2P, client/server attempt TURN-first WebRTC data-channel transport and fall back to WebSocket relay.
 
 ## Project layout
 
@@ -58,6 +56,7 @@ Run it:
 ```powershell
 cd rs-peer-workspace-proxy
 $env:PROXY_PASSWORD="myProxySecret"
+$env:TURN_PUBLIC_IP="YOUR.PUBLIC.IP"
 $env:TURN_USERNAME="peer"
 $env:TURN_PASSWORD="peer-secret"
 docker compose -f docker-compose.example.yml up --build

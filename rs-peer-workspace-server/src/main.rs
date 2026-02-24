@@ -123,7 +123,6 @@ enum SignalPayload {
 #[derive(Clone)]
 struct SessionP2pMeta {
     turn: Option<TurnCredentials>,
-    use_p2p: bool,
 }
 
 #[tokio::main]
@@ -189,7 +188,7 @@ async fn main() -> anyhow::Result<()> {
             ProxyToPeer::ClientConnected {
                 session_id,
                 client_id,
-                via_p2p,
+                via_p2p: _,
                 turn,
             } => {
                 println!("client {client_id} joined session {session_id}");
@@ -197,7 +196,6 @@ async fn main() -> anyhow::Result<()> {
                     session_id,
                     SessionP2pMeta {
                         turn,
-                        use_p2p: via_p2p,
                     },
                 );
             }
@@ -222,17 +220,15 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                let meta = p2p_meta.lock().await.get(&session_id).cloned();
-                if meta.as_ref().map(|m| m.use_p2p).unwrap_or(false) {
-                    handle_client_signal(
-                        session_id,
-                        signal,
-                        meta.and_then(|m| m.turn),
-                        ws_send_tx.clone(),
-                        peer_connections.clone(),
-                    )
-                    .await?;
-                }
+                let turn = p2p_meta.lock().await.get(&session_id).and_then(|m| m.turn.clone());
+                handle_client_signal(
+                    session_id,
+                    signal,
+                    turn,
+                    ws_send_tx.clone(),
+                    peer_connections.clone(),
+                )
+                .await?;
             }
             ProxyToPeer::SessionClosed { session_id, reason } => {
                 println!("session {session_id} closed: {reason}");

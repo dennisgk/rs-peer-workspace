@@ -127,6 +127,10 @@ enum NetEvent {
     Status(String),
     Transport(String),
     Servers(Vec<String>),
+    CommandSent {
+        transport: String,
+        command: String,
+    },
     Connected {
         session_id: Uuid,
         server_name: String,
@@ -334,6 +338,10 @@ impl ClientApp {
                         self.known_servers.push(server);
                     }
                 }
+                Some(NetEvent::CommandSent { transport, command }) => {
+                    self.logs
+                        .push_str(&format!("[sent via {}] {}\n", transport, command));
+                }
                 Some(NetEvent::Connected {
                     session_id,
                     server_name,
@@ -389,8 +397,6 @@ impl ClientApp {
 
     fn send_command(&mut self, cmd: String) {
         if let Some(tx) = &self.command_tx {
-            self.logs
-                .push_str(&format!("[send requested] {}\n", cmd));
             let _ = tx.send(NetCommand::SendCommand(cmd));
         }
     }
@@ -550,16 +556,26 @@ async fn network_task(
                                 let dc = data_channel.lock().await.clone();
                                 if let Some(dc) = dc {
                                     let _ = event_tx.send(NetEvent::Transport("P2P data channel".to_string()));
-                                    let _ = dc.send_text(command_text).await;
+                                    let send_text = command_text.clone();
+                                    let _ = dc.send_text(send_text).await;
+                                    let _ = event_tx.send(NetEvent::CommandSent {
+                                        transport: "P2P data channel".to_string(),
+                                        command: command_text,
+                                    });
                                     continue;
                                 }
                             }
 
                             let _ = event_tx.send(NetEvent::Transport("WebSocket relay".to_string()));
+                            let sent_command = command_text.clone();
                             send_json(&ws_send_tx, &ClientToProxy::ClientCommand {
                                 session_id,
                                 command: command_text,
                             })?;
+                            let _ = event_tx.send(NetEvent::CommandSent {
+                                transport: "WebSocket relay".to_string(),
+                                command: sent_command,
+                            });
                         }
                     }
                     NetCommand::Disconnect => {

@@ -20,8 +20,12 @@ struct Args {
     bind: String,
     #[arg(long)]
     proxy_password: String,
-    #[arg(long, default_value = "turn:coturn:3478")]
-    turn_url: String,
+    #[arg(long)]
+    turn_url: Option<String>,
+    #[arg(long, default_value = "3478")]
+    turn_port: u16,
+    #[arg(long, default_value = "https://api.ipify.org")]
+    public_ip_service: String,
     #[arg(long, default_value = "peer")]
     turn_username: String,
     #[arg(long, default_value = "peer-secret")]
@@ -194,11 +198,12 @@ struct AppState {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let addr: SocketAddr = args.bind.parse()?;
+    let advertised_turn_url = resolve_turn_url(&args).await;
 
     let app_state = AppState {
         proxy_password: args.proxy_password,
         turn: TurnCredentials {
-            url: args.turn_url,
+            url: advertised_turn_url.clone(),
             username: args.turn_username,
             password: args.turn_password,
         },
@@ -211,8 +216,45 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("proxy listening on {}", addr);
+    println!("advertising TURN endpoint {}", advertised_turn_url);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn resolve_turn_url(args: &Args) -> String {
+    if let Some(explicit) = &args.turn_url {
+        return explicit.clone();
+    }
+
+    let explicit_ip = std::env::var("TURN_PUBLIC_IP")
+        .ok()
+        .or_else(|| std::env::var("PUBLIC_IP").ok())
+        .filter(|v| !v.trim().is_empty());
+    if let Some(ip) = explicit_ip {
+        return format!("turn:{}:{}", ip.trim(), args.turn_port);
+    }
+
+    match reqwest::get(&args.public_ip_service).await {
+        Ok(resp) => match resp.text().await {
+            Ok(ip) if !ip.trim().is_empty() => {
+                format!("turn:{}:{}", ip.trim(), args.turn_port)
+            }
+            _ => {
+                eprintln!(
+                    "failed to parse public IP response; falling back to turn:127.0.0.1:{}",
+                    args.turn_port
+                );
+                format!("turn:127.0.0.1:{}", args.turn_port)
+            }
+        },
+        Err(err) => {
+            eprintln!(
+                "failed to detect public IP from {} ({err}); falling back to turn:127.0.0.1:{}",
+                args.public_ip_service, args.turn_port
+            );
+            format!("turn:127.0.0.1:{}", args.turn_port)
+        }
+    }
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(app): State<AppState>) -> Response {

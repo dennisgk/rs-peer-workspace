@@ -3,8 +3,8 @@ version: "3.9"
 services:
   proxy:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: rs-peer-workspace-proxy/Dockerfile
     container_name: rs-peer-proxy
     environment:
       - TURN_PUBLIC_IP=${TURN_PUBLIC_IP:-}

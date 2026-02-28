@@ -1,19 +1,25 @@
+mod protocol;
+mod rpc;
+mod transport {
+    pub mod webrtc;
+}
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
-use webrtc::api::media_engine::MediaEngine;
-use webrtc::api::APIBuilder;
-use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
-use webrtc::ice_transport::ice_server::RTCIceServer;
-use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::data_channel::RTCDataChannel;
 use webrtc::peer_connection::RTCPeerConnection;
+
+use protocol::{AuthRole, PeerToProxy, ProxyToPeer, TurnCredentials};
+use rpc::handle_rpc;
+use rs_peer_workspace_shared::app::{AppEnvelope, AppPayload};
+use transport::webrtc::handle_client_signal;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -28,107 +34,14 @@ struct Args {
     server_password: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum AuthRole {
-    Server,
-    Client,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ClientToProxy {
-    AuthProxy {
-        proxy_password: String,
-        role: AuthRole,
-    },
-    RegisterServer {
-        server_name: String,
-        server_password: String,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ServerToProxy {
-    CommandOutput {
-        session_id: Uuid,
-        output: String,
-        done: bool,
-    },
-    ServerDisconnectSession {
-        session_id: Uuid,
-    },
-    ServerSignal {
-        session_id: Uuid,
-        signal: SignalPayload,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ProxyToPeer {
-    AuthOk {
-        role: AuthRole,
-    },
-    AuthError {
-        reason: String,
-    },
-    Registered {
-        server_name: String,
-    },
-    ConnectionError {
-        reason: String,
-    },
-    ClientConnected {
-        session_id: Uuid,
-        client_id: Uuid,
-        via_p2p: bool,
-        turn: Option<TurnCredentials>,
-    },
-    RunCommand {
-        session_id: Uuid,
-        command: String,
-    },
-    SessionClosed {
-        session_id: Uuid,
-        reason: String,
-    },
-    PeerSignal {
-        session_id: Uuid,
-        from: AuthRole,
-        signal: SignalPayload,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TurnCredentials {
-    url: String,
-    username: String,
-    password: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum SignalPayload {
-    SdpOffer { sdp: String },
-    SdpAnswer { sdp: String },
-    IceCandidate {
-        candidate: String,
-        sdp_mid: Option<String>,
-        sdp_mline_index: Option<u16>,
-    },
-}
-
 #[derive(Clone)]
-struct SessionP2pMeta {
+struct SessionState {
     turn: Option<TurnCredentials>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-
     let _runmat_installed_marker = "runmat-runtime";
 
     let (ws_stream, _) = connect_async(&args.proxy_url).await?;
@@ -136,7 +49,6 @@ async fn main() -> anyhow::Result<()> {
 
     let (mut write, mut read) = ws_stream.split();
     let (ws_send_tx, mut ws_send_rx) = mpsc::unbounded_channel::<String>();
-
     let writer = tokio::spawn(async move {
         while let Some(text) = ws_send_rx.recv().await {
             if write.send(Message::Text(text.into())).await.is_err() {
@@ -145,98 +57,71 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    send_json(
-        &ws_send_tx,
-        &ClientToProxy::AuthProxy {
-            proxy_password: args.proxy_password.clone(),
-            role: AuthRole::Server,
-        },
-    )?;
+    send_json(&ws_send_tx, &PeerToProxy::AuthProxy {
+        proxy_password: args.proxy_password.clone(),
+        role: AuthRole::Server,
+    })?;
+    send_json(&ws_send_tx, &PeerToProxy::RegisterServer {
+        server_name: args.server_name.clone(),
+        server_password: args.server_password.clone(),
+    })?;
 
-    send_json(
-        &ws_send_tx,
-        &ClientToProxy::RegisterServer {
-            server_name: args.server_name.clone(),
-            server_password: args.server_password.clone(),
-        },
-    )?;
-
-    let p2p_meta = Arc::new(Mutex::new(HashMap::<Uuid, SessionP2pMeta>::new()));
+    let session_meta = Arc::new(Mutex::new(HashMap::<Uuid, SessionState>::new()));
     let peer_connections = Arc::new(Mutex::new(HashMap::<Uuid, Arc<RTCPeerConnection>>::new()));
+    let data_channels = Arc::new(Mutex::new(HashMap::<Uuid, Arc<RTCDataChannel>>::new()));
 
     while let Some(message) = read.next().await {
         let message = message?;
-        let Message::Text(text) = message else {
-            continue;
-        };
-
-        let parsed = serde_json::from_str::<ProxyToPeer>(&text);
-        let Ok(proxy_message) = parsed else {
-            continue;
-        };
+        let Message::Text(text) = message else { continue; };
+        let Ok(proxy_message) = serde_json::from_str::<ProxyToPeer>(&text) else { continue; };
 
         match proxy_message {
-            ProxyToPeer::AuthOk { .. } => {
-                println!("proxy authentication succeeded");
+            ProxyToPeer::AuthOk { .. } => println!("proxy authentication succeeded"),
+            ProxyToPeer::Registered { server_name } => println!("server registered as '{server_name}'"),
+            ProxyToPeer::AuthError { reason } | ProxyToPeer::ConnectionError { reason } => anyhow::bail!("proxy rejected connection: {reason}"),
+            ProxyToPeer::PeerJoined { session_id, peer_id, via_p2p: _, turn } => {
+                println!("client {peer_id} joined session {session_id}");
+                session_meta.lock().await.insert(session_id, SessionState { turn });
             }
-            ProxyToPeer::Registered { server_name } => {
-                println!("server registered as '{server_name}'");
-            }
-            ProxyToPeer::AuthError { reason } | ProxyToPeer::ConnectionError { reason } => {
-                anyhow::bail!("proxy rejected connection: {reason}");
-            }
-            ProxyToPeer::ClientConnected {
-                session_id,
-                client_id,
-                via_p2p: _,
-                turn,
-            } => {
-                println!("client {client_id} joined session {session_id}");
-                p2p_meta.lock().await.insert(
-                    session_id,
-                    SessionP2pMeta {
-                        turn,
-                    },
-                );
-            }
-            ProxyToPeer::RunCommand {
-                session_id,
-                command,
-            } => {
-                let output = execute_command(command).await;
-                let msg = ServerToProxy::CommandOutput {
-                    session_id,
-                    output,
-                    done: true,
-                };
-                send_json(&ws_send_tx, &msg)?;
-            }
-            ProxyToPeer::PeerSignal {
-                session_id,
-                from,
-                signal,
-            } => {
+            ProxyToPeer::PeerSignal { session_id, from, signal } => {
                 if from != AuthRole::Client {
                     continue;
                 }
-
-                let turn = p2p_meta.lock().await.get(&session_id).and_then(|m| m.turn.clone());
+                let turn = session_meta.lock().await.get(&session_id).and_then(|m| m.turn.clone());
                 handle_client_signal(
                     session_id,
                     signal,
                     turn,
                     ws_send_tx.clone(),
                     peer_connections.clone(),
-                )
-                .await?;
+                    data_channels.clone(),
+                ).await?;
+            }
+            ProxyToPeer::RelayData { session_id, payload } => {
+                let maybe_dc = data_channels.lock().await.get(&session_id).cloned();
+                if let Some(dc) = maybe_dc {
+                    let _ = dc.send(&bytes::Bytes::from(payload)).await;
+                } else if let Ok(envelope) = serde_json::from_slice::<AppEnvelope>(&payload) {
+                    if let AppPayload::RpcRequest(request) = envelope.payload {
+                        let response = handle_rpc(request).await;
+                        let out = AppEnvelope {
+                            message_id: Uuid::new_v4(),
+                            payload: AppPayload::RpcResponse(response),
+                        };
+                        let bytes = serde_json::to_vec(&out)?;
+                        send_json(&ws_send_tx, &PeerToProxy::RelayData { session_id, payload: bytes })?;
+                    }
+                }
             }
             ProxyToPeer::SessionClosed { session_id, reason } => {
                 println!("session {session_id} closed: {reason}");
-                p2p_meta.lock().await.remove(&session_id);
+                session_meta.lock().await.remove(&session_id);
+                data_channels.lock().await.remove(&session_id);
                 if let Some(pc) = peer_connections.lock().await.remove(&session_id) {
                     let _ = pc.close().await;
                 }
             }
+            ProxyToPeer::Connected { .. } => {}
         }
     }
 
@@ -244,156 +129,8 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn send_json(tx: &mpsc::UnboundedSender<String>, payload: &impl Serialize) -> anyhow::Result<()> {
+pub(crate) fn send_json(tx: &mpsc::UnboundedSender<String>, payload: &impl Serialize) -> anyhow::Result<()> {
     let text = serde_json::to_string(payload)?;
     let _ = tx.send(text);
     Ok(())
-}
-
-async fn handle_client_signal(
-    session_id: Uuid,
-    signal: SignalPayload,
-    turn: Option<TurnCredentials>,
-    ws_tx: mpsc::UnboundedSender<String>,
-    peer_connections: Arc<Mutex<HashMap<Uuid, Arc<RTCPeerConnection>>>>,
-) -> anyhow::Result<()> {
-    let existing = peer_connections.lock().await.get(&session_id).cloned();
-    let pc = if let Some(existing) = existing {
-        existing
-    } else {
-        let created = create_peer_connection(session_id, turn, ws_tx.clone()).await?;
-        peer_connections
-            .lock()
-            .await
-            .insert(session_id, created.clone());
-        created
-    };
-
-    match signal {
-        SignalPayload::SdpOffer { sdp } => {
-            let offer = RTCSessionDescription::offer(sdp)?;
-            pc.set_remote_description(offer).await?;
-            let answer = pc.create_answer(None).await?;
-            pc.set_local_description(answer).await?;
-
-            if let Some(local) = pc.local_description().await {
-                send_json(
-                    &ws_tx,
-                    &ServerToProxy::ServerSignal {
-                        session_id,
-                        signal: SignalPayload::SdpAnswer { sdp: local.sdp },
-                    },
-                )?;
-            }
-        }
-        SignalPayload::IceCandidate {
-            candidate,
-            sdp_mid,
-            sdp_mline_index,
-        } => {
-            let init = RTCIceCandidateInit {
-                candidate,
-                sdp_mid,
-                sdp_mline_index,
-                username_fragment: None,
-            };
-            pc.add_ice_candidate(init).await?;
-        }
-        SignalPayload::SdpAnswer { .. } => {}
-    }
-
-    Ok(())
-}
-
-async fn create_peer_connection(
-    session_id: Uuid,
-    turn: Option<TurnCredentials>,
-    ws_tx: mpsc::UnboundedSender<String>,
-) -> anyhow::Result<Arc<RTCPeerConnection>> {
-    let mut media_engine = MediaEngine::default();
-    media_engine.register_default_codecs()?;
-    let api = APIBuilder::new().with_media_engine(media_engine).build();
-
-    let mut config = RTCConfiguration::default();
-    if let Some(turn) = turn {
-        config.ice_servers = vec![RTCIceServer {
-            urls: vec![turn.url],
-            username: turn.username,
-            credential: turn.password,
-        }];
-    }
-
-    let pc = Arc::new(api.new_peer_connection(config).await?);
-
-    let ws_tx_ice = ws_tx.clone();
-    pc.on_ice_candidate(Box::new(move |candidate| {
-        let ws_tx_inner = ws_tx_ice.clone();
-        Box::pin(async move {
-            if let Some(candidate) = candidate {
-                if let Ok(json) = candidate.to_json() {
-                    let _ = send_json(
-                        &ws_tx_inner,
-                        &ServerToProxy::ServerSignal {
-                            session_id,
-                            signal: SignalPayload::IceCandidate {
-                                candidate: json.candidate,
-                                sdp_mid: json.sdp_mid,
-                                sdp_mline_index: json.sdp_mline_index,
-                            },
-                        },
-                    );
-                }
-            }
-        })
-    }));
-
-    pc.on_data_channel(Box::new(move |dc| {
-        Box::pin(async move {
-            let dc_for_messages = dc.clone();
-            dc.on_message(Box::new(move |msg| {
-                let dc_sender = dc_for_messages.clone();
-                Box::pin(async move {
-                    let command = String::from_utf8_lossy(&msg.data).to_string();
-                    let output = execute_command(command).await;
-                    let _ = dc_sender.send_text(output).await;
-                })
-            }));
-        })
-    }));
-
-    Ok(pc)
-}
-
-async fn execute_command(command: String) -> String {
-    #[cfg(target_os = "windows")]
-    let output_result = tokio::process::Command::new("powershell")
-        .arg("-Command")
-        .arg(command)
-        .output()
-        .await;
-
-    #[cfg(not(target_os = "windows"))]
-    let output_result = tokio::process::Command::new("sh")
-        .arg("-lc")
-        .arg(command)
-        .output()
-        .await;
-
-    match output_result {
-        Ok(output) => {
-            let mut combined = String::new();
-            if !output.stdout.is_empty() {
-                combined.push_str(&String::from_utf8_lossy(&output.stdout));
-            }
-            if !output.stderr.is_empty() {
-                combined.push_str(&String::from_utf8_lossy(&output.stderr));
-            }
-            if combined.is_empty() {
-                "<no output>".to_string()
-            } else {
-                combined
-            }
-        }
-        Err(err) => format!("command execution failed: {err}"),
-    }
 }

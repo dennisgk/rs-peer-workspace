@@ -2,14 +2,14 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::State;
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use rs_peer_workspace_shared::relay::{AuthRole, PeerToProxy, ProxyToPeer, TurnCredentials};
 use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
 
@@ -30,129 +30,6 @@ struct Args {
     turn_username: String,
     #[arg(long, default_value = "peer-secret")]
     turn_password: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum AuthRole {
-    Server,
-    Client,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ClientToProxy {
-    AuthProxy {
-        proxy_password: String,
-        role: AuthRole,
-    },
-    RegisterServer {
-        server_name: String,
-        server_password: String,
-    },
-    ListServers,
-    ConnectServer {
-        server_name: String,
-        server_password: String,
-        use_p2p: bool,
-    },
-    ClientCommand {
-        session_id: Uuid,
-        command: String,
-    },
-    DisconnectSession {
-        session_id: Uuid,
-    },
-    ClientSignal {
-        session_id: Uuid,
-        signal: SignalPayload,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ServerToProxy {
-    CommandOutput {
-        session_id: Uuid,
-        output: String,
-        done: bool,
-    },
-    ServerDisconnectSession {
-        session_id: Uuid,
-    },
-    ServerSignal {
-        session_id: Uuid,
-        signal: SignalPayload,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ProxyToPeer {
-    AuthOk {
-        role: AuthRole,
-    },
-    AuthError {
-        reason: String,
-    },
-    Registered {
-        server_name: String,
-    },
-    ServersList {
-        servers: Vec<String>,
-    },
-    Connected {
-        session_id: Uuid,
-        server_name: String,
-        via_p2p: bool,
-        turn: Option<TurnCredentials>,
-    },
-    ConnectionError {
-        reason: String,
-    },
-    ClientConnected {
-        session_id: Uuid,
-        client_id: Uuid,
-        via_p2p: bool,
-        turn: Option<TurnCredentials>,
-    },
-    RunCommand {
-        session_id: Uuid,
-        command: String,
-    },
-    Output {
-        session_id: Uuid,
-        output: String,
-        done: bool,
-    },
-    SessionClosed {
-        session_id: Uuid,
-        reason: String,
-    },
-    PeerSignal {
-        session_id: Uuid,
-        from: AuthRole,
-        signal: SignalPayload,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TurnCredentials {
-    url: String,
-    username: String,
-    password: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum SignalPayload {
-    SdpOffer { sdp: String },
-    SdpAnswer { sdp: String },
-    IceCandidate {
-        candidate: String,
-        sdp_mid: Option<String>,
-        sdp_mline_index: Option<u16>,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -240,13 +117,9 @@ async fn resolve_turn_url(args: &Args) -> Option<String> {
 
     match reqwest::get(&args.public_ip_service).await {
         Ok(resp) => match resp.text().await {
-            Ok(ip) if !ip.trim().is_empty() => {
-                Some(format!("turn:{}:{}", ip.trim(), args.turn_port))
-            }
+            Ok(ip) if !ip.trim().is_empty() => Some(format!("turn:{}:{}", ip.trim(), args.turn_port)),
             _ => {
-                eprintln!(
-                    "failed to parse public IP response; disabling TURN and using WebSocket relay"
-                );
+                eprintln!("failed to parse public IP response; disabling TURN and using WebSocket relay");
                 None
             }
         },
@@ -295,49 +168,27 @@ async fn handle_socket(socket: WebSocket, app: AppState) {
             continue;
         };
 
+        let Ok(peer_msg) = serde_json::from_str::<PeerToProxy>(&text) else {
+            continue;
+        };
+
         if role.is_none() {
-            let parsed = serde_json::from_str::<ClientToProxy>(&text);
-            let Ok(ClientToProxy::AuthProxy {
-                proxy_password,
-                role: parsed_role,
-            }) = parsed
-            else {
-                let _ = send_to_connection(
-                    &app.state,
-                    conn_id,
-                    &ProxyToPeer::AuthError {
-                        reason: "first message must be auth_proxy".to_string(),
-                    },
-                )
-                .await;
+            let PeerToProxy::AuthProxy { proxy_password, role: parsed_role } = peer_msg else {
+                let _ = send_to_connection(&app.state, conn_id, &ProxyToPeer::AuthError {
+                    reason: "first message must be auth_proxy".to_string(),
+                }).await;
                 break;
             };
 
             if proxy_password != app.proxy_password {
-                let _ = send_to_connection(
-                    &app.state,
-                    conn_id,
-                    &ProxyToPeer::AuthError {
-                        reason: "invalid proxy password".to_string(),
-                    },
-                )
-                .await;
+                let _ = send_to_connection(&app.state, conn_id, &ProxyToPeer::AuthError {
+                    reason: "invalid proxy password".to_string(),
+                }).await;
                 break;
             }
 
-            {
-                let mut state = app.state.lock().await;
-                state.conn_roles.insert(conn_id, parsed_role.clone());
-            }
-
-            let _ = send_to_connection(
-                &app.state,
-                conn_id,
-                &ProxyToPeer::AuthOk {
-                    role: parsed_role.clone(),
-                },
-            )
-            .await;
+            app.state.lock().await.conn_roles.insert(conn_id, parsed_role.clone());
+            let _ = send_to_connection(&app.state, conn_id, &ProxyToPeer::AuthOk { role: parsed_role.clone() }).await;
             role = Some(parsed_role);
             continue;
         }
@@ -345,157 +196,77 @@ async fn handle_socket(socket: WebSocket, app: AppState) {
         match role {
             Some(AuthRole::Server) => {
                 if server_name.is_none() {
-                    let parsed = serde_json::from_str::<ClientToProxy>(&text);
-                    let Ok(ClientToProxy::RegisterServer {
-                        server_name: name,
-                        server_password,
-                    }) = parsed
-                    else {
-                        let _ = send_to_connection(
-                            &app.state,
-                            conn_id,
-                            &ProxyToPeer::ConnectionError {
-                                reason: "server must register before other actions".to_string(),
-                            },
-                        )
-                        .await;
+                    let PeerToProxy::RegisterServer { server_name: name, server_password } = peer_msg else {
+                        let _ = send_to_connection(&app.state, conn_id, &ProxyToPeer::ConnectionError {
+                            reason: "server must register before other actions".to_string(),
+                        }).await;
                         break;
                     };
 
-                    let mut ok = true;
-                    {
+                    let inserted = {
                         let mut state = app.state.lock().await;
                         if state.servers.contains_key(&name) {
-                            ok = false;
+                            false
                         } else {
-                            state.servers.insert(
-                                name.clone(),
-                                ServerRegistration {
-                                    conn_id,
-                                    server_password,
-                                },
-                            );
+                            state.servers.insert(name.clone(), ServerRegistration { conn_id, server_password });
+                            true
                         }
-                    }
+                    };
 
-                    if ok {
-                        let _ = send_to_connection(
-                            &app.state,
-                            conn_id,
-                            &ProxyToPeer::Registered {
-                                server_name: name.clone(),
-                            },
-                        )
-                        .await;
+                    if inserted {
+                        let _ = send_to_connection(&app.state, conn_id, &ProxyToPeer::Registered { server_name: name.clone() }).await;
                         server_name = Some(name);
                     } else {
-                        let _ = send_to_connection(
-                            &app.state,
-                            conn_id,
-                            &ProxyToPeer::ConnectionError {
-                                reason: "server name already registered".to_string(),
-                            },
-                        )
-                        .await;
+                        let _ = send_to_connection(&app.state, conn_id, &ProxyToPeer::ConnectionError {
+                            reason: "server name already registered".to_string(),
+                        }).await;
                         break;
                     }
-
                     continue;
                 }
 
-                let Ok(server_msg) = serde_json::from_str::<ServerToProxy>(&text) else {
-                    continue;
-                };
-
-                match server_msg {
-                    ServerToProxy::CommandOutput {
-                        session_id,
-                        output,
-                        done,
-                    } => {
-                        let target_client = {
-                            let state = app.state.lock().await;
-                            state.sessions.get(&session_id).map(|s| s.client_conn_id)
-                        };
-
-                        if let Some(client_conn_id) = target_client {
-                            let _ = send_to_connection(
-                                &app.state,
-                                client_conn_id,
-                                &ProxyToPeer::Output {
-                                    session_id,
-                                    output,
-                                    done,
-                                },
-                            )
-                            .await;
-                        }
-                    }
-                    ServerToProxy::ServerDisconnectSession { session_id } => {
+                match peer_msg {
+                    PeerToProxy::DisconnectSession { session_id } => {
                         let target_client = {
                             let mut state = app.state.lock().await;
-                            state
-                                .sessions
-                                .remove(&session_id)
-                                .map(|session| session.client_conn_id)
+                            state.sessions.remove(&session_id).map(|session| session.client_conn_id)
                         };
-
                         if let Some(client_conn_id) = target_client {
-                            let _ = send_to_connection(
-                                &app.state,
-                                client_conn_id,
-                                &ProxyToPeer::SessionClosed {
-                                    session_id,
-                                    reason: "server closed session".to_string(),
-                                },
-                            )
-                            .await;
+                            let _ = send_to_connection(&app.state, client_conn_id, &ProxyToPeer::SessionClosed {
+                                session_id,
+                                reason: "server closed session".to_string(),
+                            }).await;
                         }
                     }
-                    ServerToProxy::ServerSignal { session_id, signal } => {
-                        let target_client = {
+                    PeerToProxy::Signal { session_id, signal } => {
+                        if let Some(client_conn_id) = {
                             let state = app.state.lock().await;
                             state.sessions.get(&session_id).map(|s| s.client_conn_id)
-                        };
-
-                        if let Some(client_conn_id) = target_client {
-                            let _ = send_to_connection(
-                                &app.state,
-                                client_conn_id,
-                                &ProxyToPeer::PeerSignal {
-                                    session_id,
-                                    from: AuthRole::Server,
-                                    signal,
-                                },
-                            )
-                            .await;
+                        } {
+                            let _ = send_to_connection(&app.state, client_conn_id, &ProxyToPeer::PeerSignal {
+                                session_id,
+                                from: AuthRole::Server,
+                                signal,
+                            }).await;
                         }
                     }
+                    PeerToProxy::RelayData { session_id, payload } => {
+                        if let Some(client_conn_id) = {
+                            let state = app.state.lock().await;
+                            state.sessions.get(&session_id).map(|s| s.client_conn_id)
+                        } {
+                            let _ = send_to_connection(&app.state, client_conn_id, &ProxyToPeer::RelayData {
+                                session_id,
+                                payload,
+                            }).await;
+                        }
+                    }
+                    _ => {}
                 }
             }
             Some(AuthRole::Client) => {
-                let Ok(client_msg) = serde_json::from_str::<ClientToProxy>(&text) else {
-                    continue;
-                };
-
-                match client_msg {
-                    ClientToProxy::ListServers => {
-                        let servers = {
-                            let state = app.state.lock().await;
-                            state.servers.keys().cloned().collect::<Vec<_>>()
-                        };
-                        let _ = send_to_connection(
-                            &app.state,
-                            conn_id,
-                            &ProxyToPeer::ServersList { servers },
-                        )
-                        .await;
-                    }
-                    ClientToProxy::ConnectServer {
-                        server_name,
-                        server_password,
-                        use_p2p,
-                    } => {
+                match peer_msg {
+                    PeerToProxy::ConnectServer { server_name, server_password, use_p2p } => {
                         let setup = {
                             let mut state = app.state.lock().await;
                             if let Some(server) = state.servers.get(&server_name).cloned() {
@@ -503,14 +274,11 @@ async fn handle_socket(socket: WebSocket, app: AppState) {
                                     Some(Err("invalid server password".to_string()))
                                 } else {
                                     let session_id = Uuid::new_v4();
-                                    state.sessions.insert(
+                                    state.sessions.insert(session_id, Session {
                                         session_id,
-                                        Session {
-                                            session_id,
-                                            server_conn_id: server.conn_id,
-                                            client_conn_id: conn_id,
-                                        },
-                                    );
+                                        server_conn_id: server.conn_id,
+                                        client_conn_id: conn_id,
+                                    });
                                     Some(Ok((session_id, server.conn_id)))
                                 }
                             } else {
@@ -521,123 +289,68 @@ async fn handle_socket(socket: WebSocket, app: AppState) {
                         match setup {
                             Some(Ok((session_id, server_conn_id))) => {
                                 let p2p_enabled = use_p2p && app.turn.is_some();
-                                let turn_creds = if p2p_enabled {
-                                    app.turn.clone()
-                                } else {
-                                    None
-                                };
-                                let _ = send_to_connection(
-                                    &app.state,
-                                    conn_id,
-                                    &ProxyToPeer::Connected {
-                                        session_id,
-                                        server_name: server_name.clone(),
-                                        via_p2p: p2p_enabled,
-                                        turn: turn_creds.clone(),
-                                    },
-                                )
-                                .await;
-
-                                let _ = send_to_connection(
-                                    &app.state,
-                                    server_conn_id,
-                                    &ProxyToPeer::ClientConnected {
-                                        session_id,
-                                        client_id: conn_id,
-                                        via_p2p: p2p_enabled,
-                                        turn: turn_creds,
-                                    },
-                                )
-                                .await;
+                                let turn_creds = if p2p_enabled { app.turn.clone() } else { None };
+                                let _ = send_to_connection(&app.state, conn_id, &ProxyToPeer::Connected {
+                                    session_id,
+                                    server_name: server_name.clone(),
+                                    via_p2p: p2p_enabled,
+                                    turn: turn_creds.clone(),
+                                }).await;
+                                let _ = send_to_connection(&app.state, server_conn_id, &ProxyToPeer::PeerJoined {
+                                    session_id,
+                                    peer_id: conn_id,
+                                    via_p2p: p2p_enabled,
+                                    turn: turn_creds,
+                                }).await;
                             }
                             Some(Err(reason)) => {
-                                let _ = send_to_connection(
-                                    &app.state,
-                                    conn_id,
-                                    &ProxyToPeer::ConnectionError { reason },
-                                )
-                                .await;
+                                let _ = send_to_connection(&app.state, conn_id, &ProxyToPeer::ConnectionError { reason }).await;
                             }
                             None => {}
                         }
                     }
-                    ClientToProxy::ClientCommand {
-                        session_id,
-                        command,
-                    } => {
-                        let target_server = {
-                            let state = app.state.lock().await;
-                            state.sessions.get(&session_id).and_then(|session| {
-                                if session.client_conn_id == conn_id {
-                                    Some(session.server_conn_id)
-                                } else {
-                                    None
-                                }
-                            })
-                        };
-
-                        if let Some(server_conn_id) = target_server {
-                            let _ = send_to_connection(
-                                &app.state,
-                                server_conn_id,
-                                &ProxyToPeer::RunCommand {
-                                    session_id,
-                                    command,
-                                },
-                            )
-                            .await;
-                        }
-                    }
-                    ClientToProxy::DisconnectSession { session_id } => {
+                    PeerToProxy::DisconnectSession { session_id } => {
                         let target_server = {
                             let mut state = app.state.lock().await;
                             state.sessions.remove(&session_id).and_then(|session| {
-                                if session.client_conn_id == conn_id {
-                                    Some(session.server_conn_id)
-                                } else {
-                                    None
-                                }
+                                if session.client_conn_id == conn_id { Some(session.server_conn_id) } else { None }
                             })
                         };
-
                         if let Some(server_conn_id) = target_server {
-                            let _ = send_to_connection(
-                                &app.state,
-                                server_conn_id,
-                                &ProxyToPeer::SessionClosed {
-                                    session_id,
-                                    reason: "client closed session".to_string(),
-                                },
-                            )
-                            .await;
+                            let _ = send_to_connection(&app.state, server_conn_id, &ProxyToPeer::SessionClosed {
+                                session_id,
+                                reason: "client closed session".to_string(),
+                            }).await;
                         }
                     }
-                    ClientToProxy::ClientSignal { session_id, signal } => {
-                        let target_server = {
+                    PeerToProxy::Signal { session_id, signal } => {
+                        if let Some(server_conn_id) = {
                             let state = app.state.lock().await;
                             state.sessions.get(&session_id).and_then(|session| {
-                                if session.client_conn_id == conn_id {
-                                    Some(session.server_conn_id)
-                                } else {
-                                    None
-                                }
+                                if session.client_conn_id == conn_id { Some(session.server_conn_id) } else { None }
                             })
-                        };
-
-                        if let Some(server_conn_id) = target_server {
-                            let _ = send_to_connection(
-                                &app.state,
-                                server_conn_id,
-                                &ProxyToPeer::PeerSignal {
-                                    session_id,
-                                    from: AuthRole::Client,
-                                    signal,
-                                },
-                            )
-                            .await;
+                        } {
+                            let _ = send_to_connection(&app.state, server_conn_id, &ProxyToPeer::PeerSignal {
+                                session_id,
+                                from: AuthRole::Client,
+                                signal,
+                            }).await;
                         }
                     }
-                    ClientToProxy::AuthProxy { .. } | ClientToProxy::RegisterServer { .. } => {}
+                    PeerToProxy::RelayData { session_id, payload } => {
+                        if let Some(server_conn_id) = {
+                            let state = app.state.lock().await;
+                            state.sessions.get(&session_id).and_then(|session| {
+                                if session.client_conn_id == conn_id { Some(session.server_conn_id) } else { None }
+                            })
+                        } {
+                            let _ = send_to_connection(&app.state, server_conn_id, &ProxyToPeer::RelayData {
+                                session_id,
+                                payload,
+                            }).await;
+                        }
+                    }
+                    _ => {}
                 }
             }
             None => break,
@@ -658,33 +371,23 @@ async fn send_to_connection(
         let state = state.lock().await;
         state.connections.get(&conn_id).cloned()
     };
-
     if let Some(tx) = sender {
         let _ = tx.send(Message::Text(payload.into()));
     }
-
     Ok(())
 }
 
-async fn cleanup_connection(
-    state: &Arc<Mutex<ProxyState>>,
-    conn_id: Uuid,
-    server_name: Option<String>,
-) {
+async fn cleanup_connection(state: &Arc<Mutex<ProxyState>>, conn_id: Uuid, server_name: Option<String>) {
     let mut notifications: Vec<(Uuid, ProxyToPeer)> = Vec::new();
-
     {
         let mut locked = state.lock().await;
         locked.connections.remove(&conn_id);
         locked.conn_roles.remove(&conn_id);
-
         if let Some(name) = server_name {
             locked.servers.remove(&name);
         }
 
-        let affected_sessions: Vec<Uuid> = locked
-            .sessions
-            .values()
+        let affected_sessions: Vec<Uuid> = locked.sessions.values()
             .filter(|session| session.server_conn_id == conn_id || session.client_conn_id == conn_id)
             .map(|session| session.session_id)
             .collect();
@@ -692,21 +395,15 @@ async fn cleanup_connection(
         for session_id in affected_sessions {
             if let Some(session) = locked.sessions.remove(&session_id) {
                 if session.server_conn_id == conn_id {
-                    notifications.push((
-                        session.client_conn_id,
-                        ProxyToPeer::SessionClosed {
-                            session_id,
-                            reason: "server disconnected".to_string(),
-                        },
-                    ));
+                    notifications.push((session.client_conn_id, ProxyToPeer::SessionClosed {
+                        session_id,
+                        reason: "server disconnected".to_string(),
+                    }));
                 } else {
-                    notifications.push((
-                        session.server_conn_id,
-                        ProxyToPeer::SessionClosed {
-                            session_id,
-                            reason: "client disconnected".to_string(),
-                        },
-                    ));
+                    notifications.push((session.server_conn_id, ProxyToPeer::SessionClosed {
+                        session_id,
+                        reason: "client disconnected".to_string(),
+                    }));
                 }
             }
         }

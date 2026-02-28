@@ -1,0 +1,8 @@
+[workspace]
+members = [
+  "rs-peer-workspace-shared",
+  "rs-peer-workspace-client",
+  "rs-peer-workspace-server",
+  "rs-peer-workspace-proxy",
+]
+resolver = "2"
